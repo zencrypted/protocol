@@ -1,0 +1,5 @@
+(test
+ (name syntax_check)
+ (modules syntax_check)
+ (libraries z180_syntax)
+ (deps (glob_files_rec ../scenarios/*.z180)))

@@ -1,0 +1,48 @@
+# Z.180 syntax smoke: L1 (X.422.1 Skynet Serverless Multicast).
+# Authority enrollment, p2p / muc / chan feeds, Ack, File.  No brokered
+# Query family exists at this tier -- the elaborator is what rejects it.
+
+scenario announce register authenticate
+tier l1
+
+session alice
+authority announce
+authority register alicecert
+authority authenticate alicetoken
+expect authenticated
+
+scenario multicast delivery and ack
+tier l1
+
+session alice as alice1
+send message to peer bob "hi" capture id as m1id
+
+session bob as bob1
+expect message from alice body "hi"
+send ack for id m1id
+expect ack for id m1id
+
+scenario channel publication
+tier l1
+
+session alice
+send message to chan news "first post"
+send message to group room1 "muc hello"
+
+session bob
+expect message from alice body "first post"
+expect message from alice body "muc hello"
+expect event message delivered alice id m1id
+
+scenario file transfer
+tier l1
+
+session alice
+send file "order40.pdf"
+send file "order40.pdf" as doc1
+
+session bob
+expect message from alice body "order40.pdf"
+expect not message from alice body "order40.pdf"
+skip
+wait 250ms

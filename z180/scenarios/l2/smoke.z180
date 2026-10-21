@@ -1,0 +1,260 @@
+# Z.180 syntax smoke: L2 (X.422.2 Brokered TLS & PKI) surface coverage.
+# This file is parsed by the test suite; it is not executed until the
+# elaborator and kernel runner land.
+
+scenario delivery and read
+tier l2
+
+session alice as alice1
+connect
+auth
+
+session bob as bob1
+connect
+auth
+
+session alice
+send message to bob "hi" capture id as m1id
+
+session bob
+expect message from alice body "hi"
+send read for last
+
+session alice
+expect event message read bob up to 1
+
+scenario replay from a session cursor
+tier l2
+
+session alice
+connect
+auth
+
+session bob
+connect
+auth
+
+session alice
+send message to bob "m1"
+send message to bob "m2"
+
+session bob
+query events peer alice after cursor limit 10
+expect result items <= 2
+expect message from alice body "m1"
+expect no gaps
+expect no duplicates
+
+session bob
+query events peer alice after snapshot
+expect shared snapshot
+expect not more
+
+session bob
+query events peer alice after 1 limit 1
+expect events non-empty
+expect events count <= 1
+
+scenario mutation by captured id
+tier l2
+
+session alice
+connect
+auth
+
+session bob
+connect
+auth
+
+session alice
+send message to bob "v1" capture id as m1id
+edit message id m1id body "v2"
+
+session bob
+expect event message edited alice id m1id
+expect message m1id visible
+
+session alice
+delete message id m1id
+
+session bob
+expect event message deleted alice id m1id
+expect message deleted
+query inbox peer alice
+expect result items <= 0
+expect empty replay
+
+scenario structured payload
+tier l2
+
+session alice
+connect
+auth
+
+session alice
+send message to bob {
+  body: "Please review the attached Order 40 document."
+  subject: "ERP/1 Document Draft"
+  priority: high
+  amount: 1000
+  urgent: true
+}
+
+session bob
+expect message from alice {
+  body: "Please review the attached Order 40 document."
+  subject: "ERP/1 Document Draft"
+}
+query search peer alice text "draft" limit 3
+expect result items
+query search continue
+expect next
+
+scenario group membership and role
+tier l2
+
+given group room1 exists
+given alice is owner of group room1
+given bob is member of group room1
+given carol is not member of group room1
+given feed room1 has branch military
+
+session alice
+connect
+auth
+create group room2
+add bob to group room1
+remove carol from group room1
+query members of group room1
+expect result items <= 2
+
+session bob
+connect
+auth
+send message to group room1 "hello"
+query inbox group room1
+expect message from bob body "hello"
+
+when carol queries events for group room1
+expect access denied
+
+scenario moderation is policy not state
+tier l2
+
+given alice has clearance secret
+
+session alice
+connect
+auth
+ban bob in group room1
+expect bob is banned
+expect bob in moderation
+query moderation group room1
+expect result items
+
+session alice
+unban bob
+
+session bob
+connect
+auth
+query events peer alice after 0 limit 5
+expect error gap
+
+scenario field level visibility
+tier l2
+
+given message m1 has classification confidential
+given message m1 field body visible at level secret
+given message m1 field attachment hidden at level confidential
+given alice has clearance secret
+given bob has clearance confidential
+given bob has branch civil
+given bob has org acme
+
+when alice queries inbox
+expect access allowed
+
+session alice
+query inbox peer bob
+expect message m1 field body visible
+
+scenario home bootstrap and pagination
+tier l2
+
+given private alice <-> bob message 1 from alice "m1" id "msg-1" as seed1
+given private alice <-> bob message 2 from bob "m2" id "msg-2"
+given bob read private:alice up to 1
+
+session alice
+connect
+auth
+bootstrap home limit 20 preview 1
+expect shared snapshot
+expect feeds count <= 10
+expect not duplicate feeds
+expect previews
+expect mentions
+expect unread
+query home continue
+expect next
+
+session bob
+connect
+auth
+query cursor read peer alice up to 2
+expect read cursor updated
+query cursor read peer alice up to 1
+expect read cursor unchanged in peer alice
+
+scenario session recovery
+tier l2
+
+session alice1 as alice
+connect
+auth
+expect authenticated
+expect session created
+
+session alice2 as alice
+connect
+auth password "secret"
+expect same session
+reconnect
+auth resume
+expect access token refreshed
+renew
+expect access token
+
+session alice1
+disconnect
+expect event offline alice
+
+session alice2
+send typing to alice
+expect event typing alice2
+expect event presence offline alice2
+
+scenario discovery and negotiation
+tier l2
+
+session alice
+connect brokerA
+auth supportedVsn [v2 v3]
+expect selectedVsn v3
+query discover server
+expect feature protocol.version
+query discover auth
+expect feature auth.methods
+query discover extension
+expect feature extension.search
+query discover feed peer bob
+expect feature feed.replay
+query roster
+expect roster
+query groups
+expect groups
+query subscriptions
+expect subscriptions
+expect error notFound
+expect not error unauthorized

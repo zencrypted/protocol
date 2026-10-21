@@ -1,0 +1,10 @@
+(ocamllex lexer)
+
+(menhir
+ (modules parser)
+ (flags --table --explain))
+
+(library
+ (name z180_syntax)
+ (modules ast lexer parser)
+ (libraries menhirLib))
