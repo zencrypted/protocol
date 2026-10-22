@@ -1630,10 +1630,22 @@ let judge w o j =
                         else " and the comparison failed"))
   | J_flag s ->
       (match s with
-       | "more" -> if o.o_more then Pass else Fail "reply was not truncated"
-       | "not more" -> if not o.o_more then Pass else Fail "reply reported more"
-       | "next" | "snapshot" | "shared snapshot" ->
-           (match state_of o s with Some _ -> Pass | None -> Skip ("flag not reported: " ^ s))
+       (* "more" and "next" are the same claim in two dialects: the reply was
+          truncated, so another page exists.  Reading `next` off a state entry
+          instead made it unjudgeable, which is a SKIP the protocol does not
+          deserve. *)
+       | "more" | "next" ->
+           if o.o_more then Pass else Fail "reply was not truncated"
+       | "not more" | "not next" ->
+           if not o.o_more then Pass else Fail "reply reported more"
+       | "snapshot" | "shared snapshot" ->
+           (* X.422.2 names a shared snapshot without saying which epoch is
+              shared or how a reply would show it, so there is nothing to
+              assert.  Inventing a stamp here would turn the claim into the
+              vacuous green the Python corpus was built on: this reports SKIP. *)
+           (match state_of o s with
+            | Some _ -> Pass
+            | None -> Skip ("not modelled: " ^ s ^ " has no defined stamp"))
        | "no gaps" ->
            let seqs = List.map (fun ps -> ps.ps_seq) (messages_in o)
            in

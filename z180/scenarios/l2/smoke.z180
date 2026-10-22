@@ -18,7 +18,7 @@ send message to bob "hi" capture id as m1id
 
 session bob1
 expect message from alice body "hi"
-send read for last
+send read peer alice for last
 
 session alice1
 expect event message read bob up to 1
@@ -108,7 +108,7 @@ expect message from alice {
 query search peer alice text "draft" limit 3
 expect result items
 query search continue
-expect next
+expect not next
 
 scenario group membership and role
 tier l2
@@ -142,28 +142,34 @@ scenario moderation is policy not state
 tier l2
 
 given alice has clearance secret
+given group room1 exists
+given alice is owner of group room1
+given bob is member of group room1
 
 session alice
 connect
 auth
 ban bob in group room1
-expect bob is banned
+expect bob is banned in group room1
 expect bob in moderation
+expect bob is member of group room1
 query moderation group room1
 expect result items
 
 session alice
 unban bob
+expect bob is member of group room1
 
 session bob
 connect
 auth
 query events peer alice after 0 limit 5
-expect error gap
+expect no gaps
 
 scenario field level visibility
 tier l2
 
+given private alice <-> bob message 1 from alice "order 40" id "m1" as m1
 given message m1 has classification confidential
 given message m1 field body visible at level secret
 given message m1 field attachment hidden at level confidential
@@ -184,20 +190,23 @@ tier l2
 
 given private alice <-> bob message 1 from alice "m1" id "msg-1" as seed1
 given private alice <-> bob message 2 from bob "m2" id "msg-2"
+given private alice <-> bob message 3 from alice "m3" id "msg-3"
+given private alice <-> carol message 1 from carol "m4" id "msg-4"
 given bob read private:alice up to 1
 
 session alice
 connect
 auth
-bootstrap home limit 20 preview 1
+bootstrap home limit 1 preview 1
 expect shared snapshot
 expect feeds count <= 10
 expect not duplicate feeds
 expect previews
 expect mentions
 expect unread
-query home continue
 expect next
+query home continue
+expect not next
 
 session bob
 connect
@@ -259,5 +268,6 @@ query groups
 expect groups
 query subscriptions
 expect subscriptions
+query members of group nosuchgroup
 expect error notFound
 expect not error unauthorized

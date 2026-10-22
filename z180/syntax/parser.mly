@@ -525,6 +525,8 @@ flag:
   | NOT MORE          { Eflag "not more" }
   | NO MORE             { Eflag "not more" }
   | NEXT              { Eflag "next" }
+  | NOT NEXT          { Eflag "not next" }
+  | NO NEXT           { Eflag "not next" }
   | NO GAPS           { Eflag "no gaps" }
   | NO DUPLICATES     { Eflag "no duplicates" }
   | NOT DUPLICATE FEEDS { Eflag "no duplicate feeds" }
