@@ -6,5 +6,5 @@
 
 (library
  (name z180_syntax)
- (modules ast lexer parser)
+ (modules ast lexer parser reader)
  (libraries menhirLib))

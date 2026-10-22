@@ -237,6 +237,16 @@ let id_index log =
 
 let find_feed_of_id log m = List.assoc_opt m (id_index log)
 
+(* The author a Post recorded for a message, if any.  Edits and deletes do
+   not change who wrote it, so the answer always comes from the Post. *)
+let find_author log (t : mref) =
+  let rec go = function
+    | [] -> None
+    | EvPost (f', m', a, _) :: rest ->
+        if mref_eq (f', m') t then Some a else go rest
+    | _ :: rest -> go rest
+  in go log
+
 (* Posts of a feed in log order, with their feed-scoped ordinal. *)
 type post = {
   ps_ref : mref;

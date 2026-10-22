@@ -1,4 +1,4 @@
 (library
  (name z180_model)
- (modules kernel semantics)
+ (modules kernel semantics elaborator runner)
  (libraries z180_syntax))

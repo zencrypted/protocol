@@ -1,0 +1,4 @@
+(executable
+ (name z180)
+ (modules z180)
+ (libraries z180_syntax z180_model))
