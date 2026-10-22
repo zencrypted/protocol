@@ -25,9 +25,16 @@
 (*       a tombstone is never resurrected by a late or duplicate  *)
 (*       Post, and never edited away, so at-least-once delivery   *)
 (*       is idempotent and Delete dominates Edit.                 *)
-(*    4. The read cursor is DERIVED (last write wins over the     *)
-(*       EvRead stream), never stored.  Rewind therefore needs no *)
-(*       special case --- it is just a later event in a fold.     *)
+(*    4. The read cursor is DERIVED (the maximum over the EvRead  *)
+(*       stream), never stored.  A stale read claim therefore     *)
+(*       needs no special case --- the fold absorbs it, and no    *)
+(*       event can lower a cursor, because `Some n` was never     *)
+(*       reachable once k > n was in the stream.                  *)
+(*    4b. Every identity that appears in the log is a PRINCIPAL.  *)
+(*       The incidence/session dimension exists only in the       *)
+(*       observation layer (Semantics.v, w_speaker), so a session *)
+(*       can never be mistaken for the author of a message, and   *)
+(*       two incarnations of one principal share one authorship.  *)
 (*    5. Mutation addresses an existing message only: a mutation  *)
 (*       of an unknown address is a no-op on state, never a       *)
 (*       phantom fact.                                            *)
@@ -227,9 +234,16 @@ Definition am_actor (a : actor_match) : option aid :=
 (* ------------------------------------------------------------------ *)
 
 Inductive event :=
-  | EvPost   : feed -> aid -> payload -> event   (* feed, message id, payload *)
+  | EvPost   : feed -> aid -> aid -> payload -> event
+      (* feed, message id, author, payload.  The author is in the truth layer
+         because "who wrote this" is a fact the log owes the reader; it is a
+         principal, never a session (design rule 4b). *)
   | EvEdit   : feed -> aid -> payload -> event
   | EvDelete : feed -> aid -> event
+  | EvAck    : aid -> aid -> event
+      (* reader, message id.  A consumption fact, not a content fact: `project`
+         ignores it exactly as it ignores EvRead, which is why "an ack cannot
+         rewrite a message" is a property of the type rather than a test. *)
   | EvRead   : aid -> feed -> nat -> event.      (* reader, feed, up_to (seq) *)
 
 (*  A message is addressed by (feed, id).  This is the kernel form of
@@ -279,11 +293,12 @@ Inductive mstate :=
       EvEdit   on dead      -> unchanged   (Delete dominates Edit)
       EvEdit   on nothing   -> unchanged   (mutation addresses existing)
       EvDelete on anything  -> dead        (absorbing)
+      EvAck    anywhere     -> unchanged   (consumption, not content)
       EvRead   anywhere     -> unchanged   (inert on message state)     *)
 
 Definition project (cur : option mstate) (t : mref) (e : event) : option mstate :=
   match e with
-  | EvPost f m p =>
+  | EvPost f m _ p =>
       if mref_eqb (f, m) t
       then match cur with
            | None   => Some (MS_live p)
@@ -299,6 +314,7 @@ Definition project (cur : option mstate) (t : mref) (e : event) : option mstate 
       else cur
   | EvDelete f m =>
       if mref_eqb (f, m) t then Some MS_dead else cur
+  | EvAck _ _ => cur
   | EvRead _ _ _ => cur
   end.
 
@@ -336,7 +352,7 @@ Fixpoint feed_seq_aux (k : nat) (f : feed) (m : aid) (xs : list event) : option 
   | [] => None
   | e :: rest =>
       match e with
-      | EvPost f' m' _ =>
+      | EvPost f' m' _ _ =>
           if feed_eqb f' f
           then if aid_eqb m' m then Some k else feed_seq_aux (S k) f m rest
           else feed_seq_aux k f m rest
@@ -354,50 +370,101 @@ Definition feed_seq (log : list event) (t : mref) : option nat :=
 Fixpoint head_seq (f : feed) (xs : list event) : nat :=
   match xs with
   | [] => 0
-  | EvPost f' _ _ :: rest => if feed_eqb f' f then S (head_seq f rest) else head_seq f rest
+  | EvPost f' _ _ _ :: rest => if feed_eqb f' f then S (head_seq f rest) else head_seq f rest
   | _ :: rest => head_seq f rest
   end.
 
-(*  read_cursor: derived by last-write-wins over the EvRead stream.
-    Consequence, and this is the point: rewinding a read cursor to a
-    smaller seq is not a special case that has to be permitted --- it is
-    simply a later event that the fold honours.                        *)
+(*  read_cursor: derived by maximum over the EvRead stream.
+    Consequence, and this is the point: a read receipt is a *claim of
+    progress*, so the fold keeps the furthest claim ever made.  A stale
+    "read up to 1" arriving after "read up to 2" is not an error case and
+    not a rewind that has to be forbidden --- it is simply a claim the fold
+    absorbs.  The cursor stays derived: nothing is stored.                *)
 
 Definition read_step (p : aid) (f : feed) (c : option nat) (e : event) : option nat :=
   match e with
-  | EvRead p' f' n => if aid_eqb p p' && feed_eqb f f' then Some n else c
+  | EvRead p' f' n =>
+      if aid_eqb p p' && feed_eqb f f'
+      then match c with
+           | None   => Some n
+           | Some k => Some (Nat.max k n)
+           end
+      else c
   | _ => c
   end.
 
 Definition read_cursor (log : list event) (p : aid) (f : feed) : option nat :=
   fold_left (read_step p f) log None.
 
-Lemma read_step_here : forall p f c n, read_step p f c (EvRead p f n) = Some n.
+Lemma read_step_here_none : forall p f n,
+  read_step p f None (EvRead p f n) = Some n.
 Proof.
-  intros p f c n. unfold read_step.
+  intros p f n. unfold read_step.
   assert (Ha : aid_eqb p p = true) by (apply aid_eqb_spec; reflexivity).
   assert (Hf : feed_eqb f f = true) by (apply feed_eqb_spec; reflexivity).
   rewrite Ha, Hf. reflexivity.
 Qed.
 
-(*  The cursor is the *last* read in the stream, whatever came before it
-    and whatever its value: this is the fold form of "last write wins",
-    and it is what makes a rewind an ordinary event rather than a
-    privileged operation. *)
-Lemma read_cursor_snoc : forall log c p f n,
-  fold_left (read_step p f) (log ++ [EvRead p f n]) c = Some n.
+Lemma read_step_here : forall p f k n,
+  read_step p f (Some k) (EvRead p f n) = Some (Nat.max k n).
 Proof.
-  intros log. induction log as [| e log IH]; intros c p f n.
-  - rewrite app_nil_l. cbn [fold_left]. rewrite read_step_here. reflexivity.
-  - cbn [fold_left app]. rewrite IH. reflexivity.
+  intros p f k n. unfold read_step.
+  assert (Ha : aid_eqb p p = true) by (apply aid_eqb_spec; reflexivity).
+  assert (Hf : feed_eqb f f = true) by (apply feed_eqb_spec; reflexivity).
+  rewrite Ha, Hf. reflexivity.
 Qed.
 
-Lemma read_cursor_monochrome : forall log p f n,
-  read_cursor (log ++ [EvRead p f n]) p f = Some n.
+(*  Appending one read claim: the new cursor is the maximum of the old one
+    and the claim.  Stated for an arbitrary accumulator, because the fold
+    hands the claim whatever the earlier stream accumulated. *)
+Lemma read_cursor_snoc : forall log c p f n,
+  fold_left (read_step p f) (log ++ [EvRead p f n]) c
+  = match fold_left (read_step p f) log c with
+    | None   => Some n
+    | Some k => Some (Nat.max k n)
+    end.
 Proof.
-  intros log p f n. unfold read_cursor.
-  apply read_cursor_snoc.
+  intros log c p f n. rewrite fold_left_app.
+  destruct (fold_left (read_step p f) log c) as [k|];
+    [ apply read_step_here | apply read_step_here_none ].
 Qed.
+
+Lemma read_cursor_advance : forall log p f n,
+  read_cursor (log ++ [EvRead p f n]) p f
+  = match read_cursor log p f with
+    | None   => Some n
+    | Some k => Some (Nat.max k n)
+    end.
+Proof.
+  intros log p f n. unfold read_cursor. apply read_cursor_snoc.
+Qed.
+
+(*  The invariant the corpus's "stale cursor cannot un-read" row was
+    groping at, in the form that matters: appending any read event can only
+    keep or raise the cursor.  Nothing in the type system forbids an
+    EvRead with a small n --- the fold simply has no way to obey it. *)
+Lemma read_cursor_never_lower : forall log p f k n,
+  read_cursor log p f = Some k ->
+  exists m, read_cursor (log ++ [EvRead p f n]) p f = Some m /\ k <= m.
+Proof.
+  intros log p f k n H.
+  exists (Nat.max k n).
+  rewrite read_cursor_advance, H; simpl.
+  split; [ reflexivity | apply Nat.le_max_l ].
+Qed.
+
+(*  find_author: whose message is this?  Derived from the Post that put it
+    in the feed -- there is no author table to keep in step with the log, so
+    an edit or an ack cannot move the byline, and an unknown id is `None`
+    rather than a default. *)
+
+Fixpoint find_author (f : feed) (m : aid) (xs : list event) : option aid :=
+  match xs with
+  | [] => None
+  | EvPost f' m' a _ :: rest => if feed_eqb f' f && aid_eqb m' m then Some a
+                                else find_author f m rest
+  | _ :: rest => find_author f m rest
+  end.
 
 (*  feed_events: the ordered Post/Edit/Delete stream of one feed, i.e.
     what `query events` and `after <boundary>` read from.  Presence is
@@ -406,9 +473,10 @@ Qed.
 
 Definition feed_events (log : list event) (f : feed) : list event :=
   filter (fun e => match e with
-                   | EvPost f' _ _  => feed_eqb f' f
-                   | EvEdit f' _ _  => feed_eqb f' f
-                   | EvDelete f' _  => feed_eqb f' f
-                   | EvRead _ _ _   => false
+                   | EvPost f' _ _ _  => feed_eqb f' f
+                   | EvEdit f' _ _    => feed_eqb f' f
+                   | EvDelete f' _    => feed_eqb f' f
+                   | EvAck _ _        => false
+                   | EvRead _ _ _     => false
                    end) log.
 

@@ -1,4 +1,14 @@
+;; The scenario runner.  `dune runtest` runs the corpus through it, so the
+;; gate is part of the build: a model that stops checking fails the build
+;; instead of going green in a notebook.
 (executable
  (name z180)
  (modules z180)
  (libraries z180_syntax z180_model))
+
+(rule
+ (alias runtest)
+ (deps
+  (source_tree ../scenarios))
+ (action
+  (run %{exe:z180.exe} ../scenarios)))
