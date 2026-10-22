@@ -14,16 +14,19 @@ expect authenticated
 scenario multicast delivery and ack
 tier l1
 
-session alice as alice1
+session alice1 as alice
 send message to peer bob "hi" capture id as m1id
 
-session bob as bob1
+session bob1 as bob
 expect message from alice body "hi"
 send ack for id m1id
 expect ack for id m1id
 
 scenario channel publication
 tier l1
+
+given group room1 exists
+given bob is member of group room1
 
 session alice
 send message to chan news "first post"
@@ -32,17 +35,16 @@ send message to group room1 "muc hello"
 session bob
 expect message from alice body "first post"
 expect message from alice body "muc hello"
-expect event message delivered alice id m1id
+expect event message delivered bob up to 1
 
 scenario file transfer
 tier l1
 
 session alice
-send file "order40.pdf"
-send file "order40.pdf" as doc1
+send file "order40.pdf" to peer bob capture id as doc1
 
 session bob
 expect message from alice body "order40.pdf"
-expect not message from alice body "order40.pdf"
+expect message id doc1 visible
 skip
 wait 250ms

@@ -221,7 +221,10 @@ type kjudg =
   | J_vsn of string
 
 type kstmt =
-  | KS_actor of aid
+  (* Both identities of the acting name: the incidence that owns the session
+     state, and the principal it speaks as.  `KS_actor` is the only place the
+     mapping enters the world. *)
+  | KS_actor of aid * aid
   | KS_tier of tier
   | KS_given of gfact
   | KS_probe of aid * kprobe
@@ -276,7 +279,12 @@ type session = {
   ss_alias : string;              (* surface name, diagnostics only            *)
 }
 
-type pevent = { pv_actor : aid; pv_kind : string }
+type pevent = { pv_actor : aid; pv_sid : aid; pv_kind : string }
+(* A presence event names both the incidence that moved and the principal it
+   moves as, because a scenario may assert either: `expect event offline
+   alice2` is about the connection, `expect event offline alice` is about the
+   user.  Matching either spelling is a decision, recorded here rather than
+   buried in a pattern. *)
 
 type world = {
   w_tier : tier;
@@ -290,7 +298,16 @@ type world = {
   w_class : (aid * string) list;          (* message id -> label            *)
   w_field_hidden : (aid * aid * string) list; (* msg id, field, level       *)
   w_ban : (aid * aid option) list;        (* actor, scope feed or global    *)
-  w_sessions : (aid * session) list;  (* keyed by principal: one identity,
+  w_speaker : (aid * aid) list;     (* incidence -> principal.  Absent means
+        "the name is its own principal", which is every scenario that never
+        writes `session x as y`.  Two incidences of one principal then exist,
+        which both X.422.2 IncidenceId and a Z.120 instance line require:
+        presence, cursors, focus, pages, acks and consumption are per
+        incidence, while authorship, feed membership, clearance, roster and
+        bans are per principal.  Without the split, `session alice1 as alice`
+        and `session alice2 as alice` collapse into one identity and
+        `expect event offline alice2` cannot even be stated. *)
+  w_sessions : (aid * session) list;  (* keyed by INCIDENCE: one identity,
       and the epoch distinguishes incarnations.  `session alice as a1` names
       the same identity; two live incarnations of one principal in one
       scenario is not expressible, and no scenario in the corpus needs it. *)
@@ -318,7 +335,7 @@ let empty_world () = {
   w_tier = T_l2;
   w_log = []; w_groups = []; w_roster = []; w_subs = [];
   w_clearance = []; w_branch = []; w_org = []; w_class = [];
-  w_field_hidden = []; w_ban = []; w_sessions = []; w_presence = [];
+  w_field_hidden = []; w_ban = []; w_speaker = []; w_sessions = []; w_presence = [];
   w_pstream = []; w_acks = []; w_seen = [];
   w_token = 0; w_epoch = 0;
   (* The capability set of the reference model, written down rather than
@@ -337,6 +354,26 @@ let empty_world () = {
      never be confused with a minted id, in either direction. *)
   w_next_mid = 1_000_000; w_env = [];
 }
+
+(* ---- identity: incidence vs principal ---- *)
+
+(* The acting name is an incidence; the identity it acts as is a principal.
+   A name never declared as an incidence of somebody else *is* that somebody
+   -- which is what leaves every `session alice` scenario unchanged.  Presence,
+   sessions, cursors, focus, pages and acks are per incidence (Z.120 instance
+   lines; X.422.2 IncidenceId); membership, clearance, authorship, the roster,
+   subscriptions and bans are per principal, and every one of those reads goes
+   through `principal` so that two incarnations of one person cannot acquire
+   two identities. *)
+let principal w a =
+  match List.assoc_opt a w.w_speaker with Some p -> p | None -> a
+
+let set_speaker w sid pr =
+  { w with w_speaker = (sid, pr) :: List.remove_assoc sid w.w_speaker }
+
+(* Online as a principal: some incidence of theirs is online. *)
+let online_as w pr =
+  List.exists (fun (sid, on) -> on && principal w sid = pr) w.w_presence
 
 (* ---- membership: who is in a feed, and what that costs ---- *)
 
@@ -392,7 +429,8 @@ let mask w reader payload id =
   let drop =
     List.filter_map
       (fun (m, fld, lvl) ->
-        if m = id && not (clears (clearance w reader) (Some lvl)) then Some fld
+        if m = id && not (clears (clearance w (principal w reader)) (Some lvl))
+        then Some fld
         else None)
       w.w_field_hidden
   in
@@ -403,7 +441,7 @@ let mask w reader payload id =
   { pp_body = body; pp_fields = fields }
 
 let readable w reader _payload id =
-  clears (clearance w reader) (classification w id)
+  clears (clearance w (principal w reader)) (classification w id)
 
 (* ---- feed construction ---- *)
 
@@ -415,6 +453,13 @@ let ensure_feed w f =
                { gr_name = f.feed_a; gr_feed = f; gr_owner = None
                ; gr_members = []; gr_banned = []; gr_exists = true }) :: w.w_groups }
   | _ -> w
+
+(* Text of a datum, for the search haystack only.  Field names are not
+   searched: a term is a value in the payload, not a schema key. *)
+let datum_text = function
+  | Dtext s -> s
+  | Datom s -> s
+  | Dint n -> string_of_int n
 
 (* ---- the delivery queue ---- *)
 
@@ -447,7 +492,9 @@ let pending w reader =
     | [] -> List.rev acc
     | EvPost (f, m, a, p) :: t ->
         let dup = List.exists (fun ps -> mref_eq ps.ps_ref (f, m)) acc in
-        let keep = in_feed w reader f && not (List.mem m seen) && not dup in
+        let keep =
+          in_feed w (principal w reader) f && not (List.mem m seen) && not dup
+        in
         go (if keep then { ps_ref = (f, m); ps_seq = 0; ps_author = a; ps_payload = p } :: acc
             else acc) t
     | EvEdit (f, m, p) :: t ->
@@ -524,7 +571,7 @@ let group_put w name g =
 
 let resolve_feed w actor = function
   | KF f -> Some f
-  | KF_self -> Some (named_feed K_mailbox actor)
+  | KF_self -> Some (named_feed K_mailbox (principal w actor))
   | KF_focus -> List.assoc_opt actor w.w_focus
 
 let focus_on w actor f =
@@ -537,7 +584,7 @@ let focus_on w actor f =
 let cursor_snapshot w actor =
   List.filter_map
     (fun f ->
-      match read_cursor w.w_log actor f with
+      match read_cursor w.w_log (principal w actor) f with
       | Some c -> Some (actor, f, c)
       | None -> None)
     (log_feeds w)
@@ -559,7 +606,9 @@ let presence w actor on kind =
     (* Presence never enters the log.  It is an orthogonal stream, which is
        why "a typing notification rewinds a replay" is refuted by the types
        and not by a test case. *)
-    w_pstream = w.w_pstream @ [ { pv_actor = actor; pv_kind = kind } ] }
+    w_pstream =
+      w.w_pstream
+      @ [ { pv_actor = principal w actor; pv_sid = actor; pv_kind = kind } ] }
 
 let put_session w actor s =
   { w with w_sessions = (actor, s) :: List.remove_assoc actor w.w_sessions }
@@ -598,7 +647,7 @@ let open_session w actor =
   let epoch = w.w_epoch + 1 in
   let w = { w with w_epoch = epoch } in
   let w = put_session w actor
-      { ss_actor = actor; ss_connected = true; ss_token = 0; ss_epoch = epoch
+      { ss_actor = principal w actor; ss_connected = true; ss_token = 0; ss_epoch = epoch
       ; ss_fresh = true; ss_renewed = false; ss_alias = "" } in
   presence w actor true "online"
 
@@ -606,8 +655,9 @@ let gate w actor f =
   match f.f_kind with
   | K_mailbox when f.feed_a <> actor -> Some "access denied"
   | _ ->
-      if not (in_feed w actor f) then Some "access denied"
-      else if is_banned w actor f then Some "banned"
+      let pr = principal w actor in
+      if not (in_feed w pr f) then Some "access denied"
+      else if is_banned w pr f then Some "banned"
       else None
 
 (* ------------------------------------------------------------------ *)
@@ -684,7 +734,7 @@ let window_after w actor f bnd items =
   match bnd with
   | KB_seq n -> List.filter (fun ps -> ps.ps_seq > n) items
   | KB_cursor ->
-      (match read_cursor w.w_log actor f with
+      (match read_cursor w.w_log (principal w actor) f with
        | None -> items
        | Some c -> List.filter (fun ps -> ps.ps_seq > c) items)
   | KB_snapshot -> items
@@ -702,7 +752,7 @@ let all_feeds w actor =
              (fun (_, g) -> if g.gr_exists && List.mem actor g.gr_members
                             then Some g.gr_feed else None)
              w.w_groups in
-  let me = named_feed K_mailbox actor in
+  let me = named_feed K_mailbox (principal w actor) in
   List.sort_uniq feed_cmp (me :: gs @ log_feeds w)
 
 let step_query w actor q =
@@ -753,7 +803,7 @@ let step_query w actor q =
         | None ->
             let head = feed_head w.w_log f in
             let upto = min up head in
-            let w = app w (EvRead (actor, f, upto)) in
+            let w = app w (EvRead (principal w actor, f, upto)) in
             let w = focus_on w actor f in
             w, { (no_obs actor) with o_chan = Ch_events;
                    o_state = [ ("cursor", Dint upto) ] })
@@ -789,31 +839,37 @@ let step_query w actor q =
         w, paged_from actor Ch_home off page all)
   | Q_roster ->
       l2 Ch_roster (fun () ->
-        let names = try List.assoc actor w.w_roster with Not_found -> [] in
+        let names =
+          try List.assoc (principal w actor) w.w_roster with Not_found -> []
+        in
         w, obs actor Ch_roster (List.map (fun n -> Itname n) names))
   | Q_subs ->
       l2 Ch_subs (fun () ->
-        let names = try List.assoc actor w.w_subs with Not_found -> [] in
+        let names =
+          try List.assoc (principal w actor) w.w_subs with Not_found -> []
+        in
         w, obs actor Ch_subs (List.map (fun n -> Itname n) names))
   | Q_groups ->
       l2 Ch_groups (fun () ->
         let gs = List.filter_map
                    (fun (_, g) ->
-                     if g.gr_exists && List.mem actor g.gr_members then Some g.gr_name
+                     if g.gr_exists && List.mem (principal w actor) g.gr_members
+                     then Some g.gr_name
                      else None) w.w_groups in
         w, obs actor Ch_groups (List.map (fun n -> Itname n) gs))
   | Q_members name ->
       l2 Ch_members (fun () ->
         match group_get w name with
-        | None -> w, fail actor Ch_members "no such group"
+        | None -> w, fail actor Ch_members "notFound"
         | Some g ->
-            if not (List.mem actor g.gr_members) then (w, fail actor Ch_members "access denied")
+            if not (List.mem (principal w actor) g.gr_members) then
+              (w, fail actor Ch_members "access denied")
             else (w, obs actor Ch_members (List.map (fun n -> Itname n) g.gr_members)))
   | Q_moderation scope ->
       l2 Ch_moderation (fun () ->
         let gs = List.filter_map
                    (fun (_, g) ->
-                     if g.gr_exists && g.gr_owner = Some actor
+                     if g.gr_exists && g.gr_owner = Some (principal w actor)
                      then (match scope with
                            | Some f -> if feed_eq g.gr_feed f then Some g.gr_name else None
                            | None -> Some g.gr_name)
@@ -828,10 +884,19 @@ let step_query w actor q =
         let hits =
           List.concat_map (fun f -> feed_window w actor f) fs
           |> List.filter (fun ps ->
-               match ps.ps_payload.pp_body with
-               | Some b -> contains_sub (String.lowercase_ascii b)
-                             (String.lowercase_ascii text)
-               | None -> false)
+               (* X.422.2 searches the payload, so a term in a field is a hit
+                  exactly as a term in the body is.  Restricting it to the body
+                  is what made the corpus's "draft is found" row vacuous: the
+                  word lives in the subject. *)
+               let hay =
+                 (match ps.ps_payload.pp_body with
+                  | Some b -> [ b ]
+                  | None -> [])
+                 @ List.map (fun (_, d) -> datum_text d) ps.ps_payload.pp_fields
+               in
+               List.exists
+                 (fun s -> contains_sub (String.lowercase_ascii s)
+                             (String.lowercase_ascii text)) hay)
         in
         let page = take_opt lim hits in
         let w = set_page w actor (List.length page) in
@@ -985,7 +1050,7 @@ let step_raw w actor cmd =
                    let mid = w.w_next_mid in
                    let w = { w with w_next_mid = mid + 1 } in
                    let w = ensure_feed w f in
-                   let w = app w (EvPost (f, mid, actor, p)) in
+                   let w = app w (EvPost (f, mid, principal w actor, p)) in
                    let w = (match cap with
                              | Some name -> bind w name (f, mid)
                              | None -> w) in
@@ -998,7 +1063,13 @@ let step_raw w actor cmd =
                           o_state = [ ("id", Dint mid); ("seq", Dint n) ] })
   | C_read (kf, up) ->
       (match (match kf with
-              | None -> List.assoc_opt actor w.w_focus
+              | None ->
+                  (* A read names exactly one feed: an explicit target, or the
+                     feed in scope.  Guessing the mailbox instead would mark
+                     one feed read while the inbox shows several, which is a
+                     worse lie than refusing; `read for last` after a query
+                     reads what that query put in scope. *)
+                  List.assoc_opt actor w.w_focus
               | Some f -> resolve_feed w actor f) with
        | None -> w, fail actor Ch_mutation "no feed in scope"
        | Some f ->
@@ -1010,7 +1081,7 @@ let step_raw w actor cmd =
                   beyond the truth. *)
                let head = feed_head w.w_log f in
                let upto = (match up with Some n -> min n head | None -> head) in
-               let w = app w (EvRead (actor, f, upto)) in
+               let w = app w (EvRead (principal w actor, f, upto)) in
                let w = focus_on w actor f in
                w, { (no_obs actor) with o_chan = Ch_mutation;
                       o_state = [ ("cursor", Dint upto) ] })
@@ -1027,7 +1098,7 @@ let step_raw w actor cmd =
               because X.422.1 Ack carries the table it refers to.  A second
               ack of the same message adds nothing, which is the at-least-once
               claim in executable form. *)
-           let e = EvAck (actor, mid) in
+           let e = EvAck (principal w actor, mid) in
            let w = if List.exists (fun x -> x = e) w.w_log then w else app w e in
            let w = { w with w_acks =
                  if List.mem (actor, mid) w.w_acks then w.w_acks
@@ -1075,7 +1146,8 @@ let step_raw w actor cmd =
        | Some g when g.gr_exists -> w, fail actor Ch_mutation "already exists"
        | _ ->
            let f = named_feed K_group name in
-           let g = { gr_name = name; gr_feed = f; gr_owner = Some actor
+           let g = { gr_name = name; gr_feed = f
+                     ; gr_owner = Some (principal w actor)
                    ; gr_members = [ actor ]; gr_banned = []; gr_exists = true } in
            let w = group_put w name g in
            let w = focus_on w actor f in
@@ -1084,9 +1156,10 @@ let step_raw w actor cmd =
                 ; o_state = [ ("feed", Dint name) ] })
   | C_group_del name ->
       (match group_get w name with
-       | None -> w, fail actor Ch_mutation "no such group"
+       | None -> w, fail actor Ch_mutation "notFound"
        | Some g ->
-           if g.gr_owner <> Some actor then deny w actor Ch_mutation "access denied"
+           if g.gr_owner <> Some (principal w actor) then
+             deny w actor Ch_mutation "access denied"
            else
              (* The container goes; the log stays.  Deleting a group does not
                 retroactively unreise its messages, and the model says so by
@@ -1099,9 +1172,10 @@ let step_raw w actor cmd =
       (match what with
        | KA_group name ->
            (match group_get w name with
-            | None -> w, fail actor Ch_members "no such group"
+            | None -> w, fail actor Ch_members "notFound"
             | Some g ->
-                if g.gr_owner <> Some actor then deny w actor Ch_members "access denied"
+                if g.gr_owner <> Some (principal w actor) then
+                  deny w actor Ch_members "access denied"
                 else if List.mem x g.gr_members then
                   (* idempotent: a second add is not a second membership *)
                   w, { (no_obs actor) with o_chan = Ch_members;
@@ -1111,18 +1185,19 @@ let step_raw w actor cmd =
                   w, { (no_obs actor) with o_chan = Ch_members;
                          o_items = [ Itname x ] })
        | KA_roster ->
-           let w = { w with w_roster = add_to actor x w.w_roster } in
+           let w =
+             { w with w_roster = add_to (principal w actor) x w.w_roster } in
            w, { (no_obs actor) with o_chan = Ch_roster; o_items = [ Itname x ] })
   | C_remove (x, what) ->
       (match what with
        | KA_group name ->
            (match group_get w name with
-            | None -> w, fail actor Ch_members "no such group"
+            | None -> w, fail actor Ch_members "notFound"
             | Some g ->
                 (* an owner may remove anyone; a member may remove itself.
                    Anything else is denied, and denial leaves the roster
                    untouched. *)
-                if g.gr_owner <> Some actor && x <> actor then
+                if g.gr_owner <> Some (principal w actor) && x <> principal w actor then
                   w, fail actor Ch_members "access denied"
                 else
                   let w = group_put w name
@@ -1130,30 +1205,30 @@ let step_raw w actor cmd =
                   w, { (no_obs actor) with o_chan = Ch_members;
                          o_state = [ ("removed", Datom "true") ] })
        | KA_roster ->
-           let w = { w with w_roster = drop_from actor x w.w_roster } in
+           let w =
+             { w with w_roster = drop_from (principal w actor) x w.w_roster } in
            w, { (no_obs actor) with o_chan = Ch_roster;
                   o_state = [ ("removed", Datom "true") ] })
   | C_ban (x, scope, on) ->
       (match scope with
        | Some name ->
           (match group_get w name with
-            | None -> w, fail actor Ch_moderation "no such group"
+            | None -> w, fail actor Ch_moderation "notFound"
             | Some g ->
-                if g.gr_owner <> Some actor then deny w actor Ch_moderation "access denied"
+                if g.gr_owner <> Some (principal w actor) then
+                  deny w actor Ch_moderation "access denied"
                 else
-                  let members =
-                    if on then List.filter (fun y -> y <> x) g.gr_members
-                    else g.gr_members
-                  in
                   let banned =
                     if on then List.sort_uniq Int.compare (x :: g.gr_banned)
                     else List.filter (fun y -> y <> x) g.gr_banned
                   in
-                  (* A ban is policy; an unban is policy.  Neither rewrites a
-                     post, which is why "ban does not delete" needs no test:
-                     no branch here touches w_log. *)
-                  let w = group_put w name { g with gr_members = members
-                                                ; gr_banned = banned } in
+                  (* A ban is policy and nothing else: it touches neither the
+                     log nor the membership table.  `is_banned` is the gate
+                     that refuses the next post, and an unban undoes exactly
+                     the ban -- which is why "ban does not delete" and "unban
+                     does not lose a member" need no test case: no branch here
+                     rewrites a fact, and the truth layer is not in scope. *)
+                  let w = group_put w name { g with gr_banned = banned } in
                   let w = { w with w_ban =
                         (if on then (x, Some name) :: w.w_ban
                          else List.filter (fun (a, s) -> not (a = x && s = Some name)) w.w_ban) } in
@@ -1206,7 +1281,8 @@ let step w actor cmd =
    "the policy probe did not itself read the feed" a typing property. *)
 let probe w actor p =
   let allowed f =
-    if in_feed w actor f && not (is_banned w actor f) then
+    if in_feed w (principal w actor) f
+    && not (is_banned w (principal w actor) f) then
       { (no_obs actor) with o_chan = Ch_access }
     else fail actor Ch_access "access denied"
   in
@@ -1215,7 +1291,8 @@ let probe w actor p =
                 | Some f -> allowed f
                 | None -> fail actor Ch_access "no feed in scope")
   | P_inbox | P_home ->
-      (if List.exists (fun f -> in_feed w actor f) (all_feeds w actor) then
+      (if List.exists (fun f -> in_feed w (principal w actor) f) (all_feeds w actor)
+      then
          { (no_obs actor) with o_chan = Ch_access }
        else fail actor Ch_access "access denied")
   | P_events f | P_reads f | P_search f -> allowed f
@@ -1268,6 +1345,9 @@ let unread_in o =
 
 let state_of o k = List.assoc_opt k o.o_state
 
+(* Error codes on an observation are protocol enumerations (`notFound`,
+   "access denied", "gap"), not prose, so that `expect error notFound` can
+   name them; report strings inside a verdict remain prose. *)
 let cmp_ok n c =
   match c with
   | KCeq k -> n = k
@@ -1455,10 +1535,12 @@ let judge w o j =
       let presence_fam () =
         (* The presence stream is the only place these kinds exist, and it is
            disjoint from the message log by construction. *)
-        List.exists (fun pv -> pv.pv_actor = subject && pv.pv_kind = kind) w.w_pstream
+        List.exists
+          (fun pv -> (pv.pv_actor = subject || pv.pv_sid = subject) && pv.pv_kind = kind)
+          w.w_pstream
         || (match kind with
-            | "online" -> is_online w subject
-            | "offline" -> not (is_online w subject)
+            | "online" -> is_online w subject || online_as w subject
+            | "offline" -> not (is_online w subject || online_as w subject)
             | _ -> false)
       in
       let seq_case () =
@@ -1520,7 +1602,28 @@ let judge w o j =
         in
         if n < 0 then Skip ("collection not modelled: " ^ what)
         else
-          let ok = cmp_ok n cmp in
+          (* Two readings of the bare form, because the two nouns differ.
+             "expect roster" names a *structure*: the reply was a roster, and
+             an empty one still is one.  It is refutable because a refused,
+             unknown or unsupported reply is `blocked` and fails above, and
+             because `expect not roster` denies it -- and because the channel
+             has to be the one that answers that query.
+             "expect result items" names *content*: there is at least one.
+             An empty inbox answering "items" is the vacuous green the Python
+             oracle was built on, so counts keep demanding a witness. *)
+          let shape = match what with
+            | "roster" -> Some Ch_roster
+            | "groups" -> Some Ch_groups
+            | "subscriptions" -> Some Ch_subs
+            | "members" -> Some Ch_members
+            | "moderation" -> Some Ch_moderation
+            | _ -> None
+          in
+          let ok =
+            match cmp, shape with
+            | KCplain, Some c -> o.o_chan = c
+            | _ -> cmp_ok n cmp
+          in
           if (if neg then not ok else ok) then Pass
           else Fail (what ^ " counted " ^ string_of_int n
                      ^ (if neg then " but the negated comparison held" 
@@ -1543,28 +1646,37 @@ let judge w o j =
            if dups = 0 then Pass else Fail (string_of_int dups ^ " duplicates")
        | _ -> Skip ("flag not modelled: " ^ s))
   | J_rel { actor = x; kind; neg } ->
-      (* `expect bob in roster` is a claim about the *current session's*
-         roster: the surface form carries no owner, so the elaborator binds
-         it to whoever is speaking. *)
-      let tbl = if kind = "roster" then w.w_roster else w.w_subs in
-      let got = mem_tbl actor x tbl in
+      (* These claims are about the *current session's* tables: the surface
+         form carries no owner, so the elaborator binds them to whoever is
+         speaking.  `in moderation` is not a contact list -- it says that a
+         principal I moderate has banned somebody in one of my groups. *)
+      let got = match kind with
+        | "roster" -> mem_tbl (principal w actor) x w.w_roster
+        | "subscriptions" -> mem_tbl (principal w actor) x w.w_subs
+        | "moderation" ->
+            List.exists
+              (fun (b, sc) ->
+                b = x
+                && (match sc with
+                   | Some g -> (match group_get w g with
+                               | Some gr ->
+                                   gr.gr_exists
+                                   && gr.gr_owner = Some (principal w actor)
+                               | None -> false)
+                   | None -> false)) w.w_ban
+        | _ -> false
+      in
       if neg then (if got then Fail "relation present" else Pass)
       else if got then Pass else Fail "relation absent"
   | J_ban (x, scope) ->
+      (* Being banned and being a member are different facts about the same
+         principal, asked separately and neither implying the other. *)
       let global = List.exists (fun (a, s) -> a = x && s = None) w.w_ban in
       let scoped = (match scope with
                     | Some g -> List.exists (fun (a, s) -> a = x && s = Some g) w.w_ban
                     | None -> false)
       in
-      let member_g = (match scope with
-                      | Some g -> (match group_get w g with
-                                   | Some gr -> List.mem x gr.gr_members
-                                   | None -> false)
-                      | None -> false)
-      in
-      if global || scoped || (scope = None && global) then Pass
-      else if member_g then Fail "principal is a member, not banned"
-      else Fail "not banned"
+      if global || scoped then Pass else Fail "not banned"
   | J_exists (what, name) ->
       (match what with
        | "group" ->
@@ -1585,7 +1697,7 @@ let judge w o j =
       let changed =
         List.exists
           (fun fd ->
-            let now = read_cursor w.w_log actor fd in
+            let now = read_cursor w.w_log (principal w actor) fd in
             let then_ = (match stamped_cursor w actor fd with
                          | Some (_, _, c) -> Some c
                          | None -> None) in

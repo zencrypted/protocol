@@ -234,12 +234,12 @@ let rec cmd t actor = function
          which presence channel is lit, and is carried for that reason only. *)
       Ok (C_typing (if f.feed_a = actor then f.feed_b else f.feed_a))
   | Csend_ack m -> Ok (C_ack (msgref t m))
-  | Csend_file { name; mime } ->
-      (* `send file "x.pdf" as doc1`: the grammar overloaded `as`, and the
-         corpus uses it as a capture alias, not a media type.  Elaborated as
-         the alias it is used as; the surface form stays a known wart until
-         the corpus port gives it its own keyword. *)
-      Ok (C_post (KF_self, text_payload name, Option.map (intern t) mime))
+  | Csend_file { name; target; capture } ->
+      (* No sugar survives: a File elaborates to the same post a message is,
+         with the object name as its body.  A media type is a payload field,
+         written in the struct form, not a second keyword. *)
+      let* f = kfeed_of_target t actor target in
+      Ok (C_post (f, text_payload name, Option.map (intern t) capture))
   | Cedit { m; mut } ->
       let* km =
         (match mut with
@@ -373,7 +373,7 @@ let judgment t actor = function
    silent run as principal 0. *)
 let stmts (sc : scenario) : (kstmt list * interner, string) result =
   let t = create () in
-  let rec go actor i acc = function
+  let rec go sp sid pr i acc = function
     | [] -> Ok (List.rev acc, t)
     | s :: rest ->
         let named k =
@@ -383,43 +383,61 @@ let stmts (sc : scenario) : (kstmt list * interner, string) result =
         in
         match s with
         | SSess { session; as_ } ->
-            let _ = as_ in
-            (* The world keys sessions by principal, so the incarnation alias
-               is diagnostics only -- see the comment on `w_sessions`. *)
+            (* `session alice2 as alice` declares a second incidence of one
+               principal.  The incidence owns the session record, the presence
+               bit, the read cursor and the captured pages; the principal owns
+               the mailbox, the roster, the clearance and the authorship of
+               anything posted from here.  Without `as_` the name is its own
+               principal, which keeps every single-incidence scenario unchanged. *)
             let a = intern t session in
-            go a (i + 1) (KS_actor a :: acc) rest
+            (* A bare `session alice1` re-selects an incidence.  If that name
+               was already declared as somebody's incarnation, its principal is
+               the one already established -- restating `as alice` is not a
+               precondition for coming back to the same session.  Only a first
+               mention, or an explicit `as`, decides whose incidence it is. *)
+            let p = match as_ with
+              | Some n -> intern t n
+              | None -> (match List.assoc_opt session sp with
+                         | Some p -> p
+                         | None -> a)
+            in
+            let sp = (session, p) :: List.remove_assoc session sp in
+            go sp a p (i + 1) (KS_actor (a, p) :: acc) rest
         | Stier tl ->
-            go actor (i + 1)
+            go sp sid pr (i + 1)
               (KS_tier (if tl = Ast.L1 then T_l1 else T_l2) :: acc)
               rest
         | SGiven f ->
-            let* gf = named (fact t actor f) in
-            go actor (i + 1) (KS_given gf :: acc) rest
+            let* gf = named (fact t pr f) in
+            go sp sid pr (i + 1) (KS_given gf :: acc) rest
         | Swhen { actor = a; probe = p } ->
             (* A probe is anchored on the principal being probed, not on the
                session that happens to be current -- `when carol queries events
                for group room1` asks about carol wherever it is written. *)
             let pa = intern t a in
             let* kp = named (probe t pa p) in
-            go actor (i + 1) (KS_probe (pa, kp) :: acc) rest
+            go sp sid pr (i + 1) (KS_probe (pa, kp) :: acc) rest
         | SExpect e ->
             (* An expectation needs a speaker, but not necessarily a session:
                `when carol queries events ... / expect access denied` asserts
                about carol's probe, and the observation carries that actor.
                Declining to elaborate it would be wrong; the runner is the
                place that can tell whether an observation actually arrived. *)
-            let* kj = named (judgment t actor e) in
-            go actor (i + 1) (KS_expect kj :: acc) rest
+            let* kj = named (judgment t pr e) in
+            go sp sid pr (i + 1) (KS_expect kj :: acc) rest
         | SCmd c ->
-            if actor = no_principal then
+            if sid = no_principal then
               Error (Printf.sprintf "%s, statement %d: command before any session" sc.Ast.name i)
             else
-              let* kc = named (cmd t actor c) in
-              go actor (i + 1) (KS_cmd (actor, kc) :: acc) rest
-        | Swait ms -> go actor (i + 1) (KS_wait ms :: acc) rest
-        | Sskip -> go actor (i + 1) (KS_skip :: acc) rest
+              (* The command acts as the incidence -- that is what makes two
+                 incarnations of one principal have separate connection state --
+                 while its feed targets resolve against the principal. *)
+              let* kc = named (cmd t pr c) in
+              go sp sid pr (i + 1) (KS_cmd (sid, kc) :: acc) rest
+        | Swait ms -> go sp sid pr (i + 1) (KS_wait ms :: acc) rest
+        | Sskip -> go sp sid pr (i + 1) (KS_skip :: acc) rest
   in
-  go no_principal 1 [] sc.Ast.stmts
+  go [] no_principal no_principal 1 [] sc.Ast.stmts
 
 (* `scenario` is what the runner uses.  `names` exposes the interner's table
    afterwards, which is the only way a report can print "bob" instead of 3. *)

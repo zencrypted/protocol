@@ -38,7 +38,8 @@ let owed w reader = obs reader Ch_inbox (List.map item_of (pending w reader))
 (* ---- rendering, for the report only ---- *)
 
 let describe nm = function
-  | KS_actor a -> "session " ^ nm a
+  | KS_actor (a, p) ->
+      "session " ^ nm a ^ (if a = p then "" else " as " ^ nm p)
   | KS_tier T_l1 -> "tier l1"
   | KS_tier T_l2 -> "tier l2"
   | KS_given gf -> "given " ^ (match gf with
@@ -112,7 +113,7 @@ let describe nm = function
          | J_error (c, neg) -> (if neg then "not " else "") ^ "error " ^ c
          | J_coll { what; _ } -> what
          | J_flag s -> s
-         | J_rel { actor; _ } -> nm actor ^ " in roster"
+         | J_rel { actor; kind; _ } -> nm actor ^ " in " ^ kind
          | J_ban (a, _) -> nm a ^ " banned"
          | J_exists (w_, n) -> w_ ^ " " ^ nm n ^ " exists"
          | J_role (a, r, g) -> nm a ^ " " ^ r ^ " of " ^ nm g
@@ -155,10 +156,14 @@ let run ?(names = []) (name : string) (kss : kstmt list) : report =
   let step_st st k =
     let src = describe nm k in
     match k with
-    | KS_actor a ->
-        (* A new speaker inherits no observation: alice's reply is not what
-           bob was shown, and sharing it would assert across principals. *)
-        ({ st with w = st.w; actor = a; last = None }, src, Pass)
+    | KS_actor (a, p) ->
+        (* The incidence is registered as speaking for a principal before any
+           command runs, so `connect` mints a session owned by the incidence
+           while the mailbox it fills belongs to the principal.  A new speaker
+           inherits no observation: alice's reply is not what bob was shown,
+           and sharing it would assert across principals. *)
+        let w = set_speaker st.w a p in
+        ({ st with w; actor = a; last = None }, src, Pass)
     | KS_tier t -> ({ st with w = { st.w with w_tier = t } }, src, Pass)
     | KS_given gf ->
         let w = apply_fact st.w gf in

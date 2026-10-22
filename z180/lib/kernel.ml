@@ -207,9 +207,14 @@ let feed_head log f = head_seq (feed_events log f)
 (* A cursor is (principal, feed) -> highest ordinal read, last write wins.
    Rewinding is expressible because a shorter log simply has fewer Reads in
    it; there is no cursor mutation to get wrong. *)
+(* A read receipt advances a cursor and never rewinds it.  Folding the max
+   keeps the derived cursor a pure fold of the log -- the truth is still
+   append-only and every claim stays in it -- while a stale "read up to 1"
+   delivered after "read up to 2" cannot un-read message 2. *)
 let read_step (p : aid) (f : feed) (cur : int option) (e : event) : int option =
   match e with
-  | EvRead (p', f', c) when aid_eq p p' && feed_eq f f' -> Some c
+  | EvRead (p', f', c) when aid_eq p p' && feed_eq f f' ->
+      (match cur with Some k when k > c -> cur | _ -> Some c)
   | _ -> cur
 
 let read_cursor log p f =

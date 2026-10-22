@@ -5,22 +5,22 @@
 scenario delivery and read
 tier l2
 
-session alice as alice1
+session alice1 as alice
 connect
 auth
 
-session bob as bob1
+session bob1 as bob
 connect
 auth
 
-session alice
+session alice1
 send message to bob "hi" capture id as m1id
 
-session bob
+session bob1
 expect message from alice body "hi"
 send read for last
 
-session alice
+session alice1
 expect event message read bob up to 1
 
 scenario replay from a session cursor
@@ -222,9 +222,11 @@ auth password "secret"
 expect same session
 reconnect
 auth resume
-expect access token refreshed
-renew
 expect access token
+expect same session
+
+renew
+expect access token refreshed
 
 session alice1
 disconnect
@@ -233,6 +235,7 @@ expect event offline alice
 session alice2
 send typing to alice
 expect event typing alice2
+disconnect
 expect event presence offline alice2
 
 scenario discovery and negotiation

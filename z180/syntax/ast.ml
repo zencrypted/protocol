@@ -141,7 +141,12 @@ type cmd =
   | Csend_read of { target : target option; up_to : int option }  (* None = last *)
   | Csend_typing of target
   | Csend_ack of msgref                     (* L1: Ack { table, id }           *)
-  | Csend_file of { name : string; mime : string option }
+  | Csend_file of { name : string; target : target
+                   ; capture : string option }
+      (* X.422.1 File is not a side channel: it is a message whose body names
+         an object, so it takes the same target and capture as SEND MESSAGE.
+         The old `as MIME` overload was a grammar wart -- a media type belongs
+         in the struct payload as a field, where `expect field` can see it. *)
   | Cedit of { m : msgref; mut : mutation }
   | Cdelete of msgref
   | Cdelete_group of string

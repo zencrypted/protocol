@@ -225,10 +225,8 @@ cmd:
       { Csend_typing $4 }
   | SEND ACK FOR msgref
       { Csend_ack $4 }
-  | SEND FILE STR
-      { Csend_file { name = $3; mime = None } }
-  | SEND FILE STR AS IDENT
-      { Csend_file { name = $3; mime = Some $5 } }
+  | SEND FILE STR TO target capture_opt
+      { Csend_file { name = $3; target = $5; capture = $6 } }
   | EDIT MESSAGE msgref BODY STR
       { Cedit { m = $3; mut = Mubody $5 } }
   | EDIT MESSAGE msgref FIELD field_name value
